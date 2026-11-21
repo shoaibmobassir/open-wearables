@@ -15,7 +15,7 @@ from tests.utils import developer_auth_headers
 @pytest.fixture(autouse=True)
 def mock_celery_tasks() -> Generator[MagicMock, None, None]:
     """Mock Celery tasks to prevent actual task execution during tests."""
-    with patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as mock:
+    with patch("app.api.routes.v1.sdk_sync.process_sdk_upload", autospec=True) as mock:
         mock.delay.return_value = None
         yield mock
 
@@ -55,7 +55,7 @@ class TestSDKSyncWithSDKToken:
 
         response = client.post(
             f"{api_v1_prefix}/sdk/users/{user_id}/sync/",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json={
                 "data": {
                     "provider": "apple",

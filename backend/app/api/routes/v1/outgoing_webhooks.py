@@ -27,7 +27,7 @@ from app.schemas.webhooks.endpoints import (
     WebhookMessageAttemptResponse,
     WebhookMessageResponse,
 )
-from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, EVENT_TYPE_GROUPS, WebhookEventType
+from app.schemas.webhooks.event_types import EVENT_TYPE_GROUPS, WebhookEventType
 from app.services import DeveloperDep
 from app.services.outgoing_webhooks import svix as svix_service
 
@@ -39,7 +39,7 @@ def _ep_to_response(ep: EndpointOut) -> EndpointResponse:
         id=ep.id,
         url=ep.url,
         description=ep.description,
-        filter_types=ep.filter_types,
+        filter_types=ep.event_types,
         user_id=svix_service.user_id_from_endpoint(ep),
     )
 
@@ -71,8 +71,7 @@ def create_endpoint(body: EndpointCreateRequest, app_id: SvixAppId) -> EndpointR
 
 @router.get("/endpoints")
 def list_endpoints(app_id: SvixAppId) -> list[EndpointResponse]:
-    result = svix_service.list_endpoints(app_id)
-    return [_ep_to_response(ep) for ep in result.data]
+    return [_ep_to_response(ep) for ep in svix_service.iter_endpoints(app_id)]
 
 
 @router.get("/endpoints/{endpoint_id}")
@@ -110,12 +109,8 @@ def get_endpoint_secret(endpoint_id: str, app_id: SvixAppId) -> EndpointSecretRe
 @router.get("/event-types")
 def list_event_types() -> list[EventTypeResponse]:
     return [
-        EventTypeResponse(
-            name=evt.value,
-            description=EVENT_TYPE_DESCRIPTIONS.get(evt, ""),
-            child_events=EVENT_TYPE_GROUPS.get(evt.value) or None,
-        )
-        for evt in WebhookEventType
+        EventTypeResponse(name=name, description=description, child_events=EVENT_TYPE_GROUPS.get(name) or None)
+        for name, description in svix_service.event_types().items()
     ]
 
 
@@ -172,6 +167,7 @@ def list_endpoint_attempts(
         after=after,
         status=MessageStatus(status) if status is not None else None,
         event_types=event_types,
+        with_content=True,
     )
     result = svix_service.list_message_attempts(app_id, endpoint_id, options)
 

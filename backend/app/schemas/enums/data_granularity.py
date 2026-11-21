@@ -1,4 +1,7 @@
+from datetime import timedelta
 from enum import StrEnum
+
+from app.schemas.enums.period_kind import PeriodKind
 
 
 class DataGranularity(StrEnum):
@@ -20,4 +23,33 @@ class DataGranularity(StrEnum):
 GRANULARITY_WINDOW_SECONDS: dict[DataGranularity, int] = {
     DataGranularity.DAILY: 86_400,
     DataGranularity.HOURLY: 3_600,
+}
+
+
+class Resolution(StrEnum):
+    """Bucket width requested when reading time series. RAW returns stored samples untouched; day, week
+    and month read the day aggregates instead of the samples."""
+
+    RAW = "raw"
+    ONE_MIN = "1min"
+    FIVE_MIN = "5min"
+    FIFTEEN_MIN = "15min"
+    ONE_HOUR = "1hour"
+    ONE_DAY = "1day"
+    ONE_WEEK = "1week"
+    ONE_MONTH = "1month"
+
+
+BUCKET_SIZES: dict[Resolution, timedelta] = {
+    Resolution.ONE_MIN: timedelta(minutes=1),
+    Resolution.FIVE_MIN: timedelta(minutes=5),
+    Resolution.FIFTEEN_MIN: timedelta(minutes=15),
+    Resolution.ONE_HOUR: timedelta(hours=1),
+}
+
+# Calendar periods, read from series_aggregate rather than bucketed from samples.
+PERIOD_RESOLUTIONS: dict[Resolution, PeriodKind] = {
+    Resolution.ONE_DAY: PeriodKind.DAY,
+    Resolution.ONE_WEEK: PeriodKind.WEEK,
+    Resolution.ONE_MONTH: PeriodKind.MONTH,
 }

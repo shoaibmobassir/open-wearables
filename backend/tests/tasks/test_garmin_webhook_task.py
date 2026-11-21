@@ -9,18 +9,32 @@ Tests process_push task for:
 - Retry behaviour on infrastructure errors
 """
 
-from unittest.mock import MagicMock, patch
+from collections.abc import Generator
+from datetime import datetime, timezone
+from unittest.mock import ANY, MagicMock, create_autospec, patch
 
+import httpx
 import pytest
+import respx
 from celery.exceptions import Retry
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.webhook_push_task import process_webhook_push
+from app.repositories import UserConnectionRepository
 from app.schemas.auth import ConnectionStatus
+from app.services.providers.api_client import get_valid_token
+from app.services.providers.factory import ProviderFactory
+from app.services.providers.garmin.backfill_state import get_backfill_status, mark_type_success
+from app.services.providers.garmin.oauth import GarminOAuth
+from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from tests.factories import UserConnectionFactory, UserFactory
 
 MODULE = "app.integrations.celery.tasks.webhook_push_task"
 HANDLER_MODULE = "app.services.providers.garmin.webhook_handler"
+LIFECYCLE_MODULE = "app.services.providers.garmin.handlers.lifecycle"
+BASE_OAUTH_MODULE = "app.services.providers.templates.base_oauth"
+GARMIN_TOKEN_URL = "https://diauth.garmin.com/di-oauth2-service/oauth/token"
 
 
 @pytest.fixture
@@ -31,9 +45,9 @@ def task_db(db: Session) -> Session:
     premature session teardown.
     """
     with (
-        patch(f"{MODULE}.SessionLocal", return_value=db),
-        patch(f"{MODULE}.ProviderFactory") as mock_factory_cls,
-        patch.object(db, "close", MagicMock()),
+        patch(f"{MODULE}.SessionLocal", autospec=True, return_value=db),
+        patch(f"{MODULE}.ProviderFactory", autospec=True) as mock_factory_cls,
+        patch.object(db, "close", autospec=True),
     ):
         from app.services.providers.garmin.strategy import GarminStrategy
 
@@ -47,7 +61,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_success(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test successfully receiving and saving a Garmin push activity."""
         # Arrange
@@ -88,7 +101,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_user_not_found(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test push webhook with unknown Garmin user."""
         # Arrange - no user connection created
@@ -117,7 +129,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_multiple_activities(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test push webhook with multiple activities from different users."""
         # Arrange
@@ -165,7 +176,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_different_activity_types(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test push webhook with different activity types."""
         # Arrange
@@ -200,7 +210,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_empty_activities(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test push webhook with empty activities list."""
         # Arrange
@@ -216,7 +225,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_activity_validation_error(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Activity missing required fields triggers ValidationError → status validation_error."""
         # Arrange
@@ -250,7 +258,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_hrv_data(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test push webhook with HRV data."""
         # Arrange
@@ -288,7 +295,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_epochs_batch_logging(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test push webhook with multiple epochs (batch processing)."""
         # Arrange
@@ -329,7 +335,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_dailies_data(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test push webhook with dailies data."""
         # Arrange
@@ -376,7 +381,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_sleeps_data(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test push webhook with sleep data."""
         # Arrange
@@ -411,7 +415,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_wellness_unknown_user_skipped(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Wellness data for unknown Garmin user is skipped — processed==1, saved==0."""
         # No connection created — user is unknown
@@ -446,7 +449,6 @@ class TestGarminPushWebhook:
     def test_push_webhook_backfill_chaining_triggered(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Backfill next type is triggered when a new type success occurs during active backfill."""
         user = UserFactory()
@@ -476,14 +478,16 @@ class TestGarminPushWebhook:
 
         # Act — override autouse patches to simulate an active backfill
         with (
-            patch(f"{HANDLER_MODULE}.mark_type_success", return_value=True),
+            patch(f"{HANDLER_MODULE}.mark_type_success", create_autospec(mark_type_success, return_value=True)),
             patch(
                 f"{HANDLER_MODULE}.get_backfill_status",
-                return_value={"overall_status": "in_progress", "current_window": 1, "total_windows": 5},
+                create_autospec(
+                    get_backfill_status,
+                    return_value={"overall_status": "in_progress", "current_window": 1, "total_windows": 5},
+                ),
             ),
-            patch(f"{HANDLER_MODULE}.celery_app") as mock_celery,
+            patch(f"{HANDLER_MODULE}.celery_app", autospec=True) as mock_celery,
         ):
-            mock_celery.send_task.return_value = MagicMock(id="backfill-task")
             result = process_webhook_push.run("garmin", payload, "trace-015")
 
         # Assert — backfill chaining was triggered
@@ -497,7 +501,6 @@ class TestGarminUserPermissionsWebhook:
     def test_push_webhook_permissions_scope_expanded(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test that scope is expanded when user grants more permissions."""
         # Arrange
@@ -532,7 +535,6 @@ class TestGarminUserPermissionsWebhook:
     def test_push_webhook_permissions_scope_reduced(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test that scope is reduced when user revokes permissions."""
         # Arrange
@@ -567,7 +569,6 @@ class TestGarminUserPermissionsWebhook:
     def test_push_webhook_permissions_scope_unchanged(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test that scope remains functionally the same when permissions haven't changed."""
         # Arrange
@@ -601,7 +602,6 @@ class TestGarminUserPermissionsWebhook:
     def test_push_webhook_user_permissions_unknown_user(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test userPermissionsChange with unknown user is a no-op (idempotent)."""
         # Arrange - no user connection created
@@ -625,7 +625,6 @@ class TestGarminUserPermissionsWebhook:
     def test_push_webhook_permissions_invalid_entries(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Malformed permission entries (non-dict, missing userId) are skipped with errors."""
         payload = {
@@ -646,7 +645,6 @@ class TestGarminUserPermissionsWebhook:
     def test_push_webhook_permissions_not_a_list(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Non-list userPermissionsChange payload is rejected with a format error."""
         result = process_webhook_push.run("garmin", {"userPermissionsChange": "not_a_list"}, "trace-026b")
@@ -655,13 +653,30 @@ class TestGarminUserPermissionsWebhook:
         assert result["userPermissionsChange"]["errors"] == ["Invalid userPermissions payload format"]
 
 
+def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://apis.garmin.com/partner-gateway/rest/user/id")
+    return httpx.HTTPStatusError("error", request=request, response=httpx.Response(status_code, request=request))
+
+
+@pytest.fixture
+def mock_garmin_user_id() -> Generator[MagicMock, None, None]:
+    with patch.object(GarminOAuth, "get_user_id", autospec=True, side_effect=_http_status_error(401)) as mock:
+        yield mock
+
+
+@pytest.fixture
+def mock_revoked_webhook() -> Generator[MagicMock, None, None]:
+    with patch(f"{LIFECYCLE_MODULE}.on_connection_revoked", autospec=True) as mock:
+        yield mock
+
+
 class TestGarminDeregistrationWebhook:
     """Tests for deregistration handling via process_push."""
 
     def test_push_webhook_deregistration_revokes_connection(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
+        mock_garmin_user_id: MagicMock,
     ) -> None:
         """Test that deregistration revokes the connection."""
         # Arrange
@@ -691,10 +706,137 @@ class TestGarminDeregistrationWebhook:
         task_db.refresh(connection)
         assert connection.status == ConnectionStatus.REVOKED
 
+    def test_stale_ping_ignored_when_current_grant_is_active(
+        self,
+        task_db: Session,
+        mock_garmin_user_id: MagicMock,
+        mock_revoked_webhook: MagicMock,
+    ) -> None:
+        """A ping for an old grant must not revoke a connection the user re-authorized."""
+        connection = UserConnectionFactory(user=UserFactory(), provider="garmin", provider_user_id="garmin_user_123")
+        mock_garmin_user_id.side_effect = None
+        mock_garmin_user_id.return_value = "garmin_user_123"
+
+        result = process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-036")
+
+        assert result["deregistrations"] == {"revoked": 0, "ignored_stale": 1, "errors": []}
+        mock_garmin_user_id.assert_called_once_with(ANY, connection.access_token)
+        task_db.refresh(connection)
+        assert connection.status == ConnectionStatus.ACTIVE
+        mock_revoked_webhook.assert_not_called()
+
+    def test_grant_check_ignores_token_cached_in_session(
+        self,
+        task_db: Session,
+        mock_garmin_user_id: MagicMock,
+        mock_revoked_webhook: MagicMock,
+    ) -> None:
+        """A token refreshed by another worker is used, not the stale one cached earlier in the session."""
+        connection = UserConnectionFactory(user=UserFactory(), provider="garmin", provider_user_id="garmin_user_123")
+        get_valid_token(
+            task_db,
+            connection.user_id,
+            "garmin",
+            UserConnectionRepository(),
+            create_autospec(BaseOAuthTemplate, instance=True),
+        )
+        task_db.execute(
+            text("UPDATE user_connection SET access_token = 'refreshed-by-another-worker' WHERE id = :id"),
+            {"id": connection.id},
+        )
+        mock_garmin_user_id.side_effect = None
+        mock_garmin_user_id.return_value = "garmin_user_123"
+
+        result = process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-040")
+
+        assert result["deregistrations"]["ignored_stale"] == 1
+        mock_garmin_user_id.assert_called_once_with(ANY, "refreshed-by-another-worker")
+        mock_revoked_webhook.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "user_id_response",
+        [
+            pytest.param(_http_status_error(503), id="garmin_error"),
+            pytest.param("other_garmin_user", id="different_user"),
+        ],
+    )
+    def test_revokes_unless_garmin_confirms_the_grant(
+        self,
+        task_db: Session,
+        mock_garmin_user_id: MagicMock,
+        mock_revoked_webhook: MagicMock,
+        user_id_response: Exception | str,
+    ) -> None:
+        connection = UserConnectionFactory(user=UserFactory(), provider="garmin", provider_user_id="garmin_user_123")
+        if isinstance(user_id_response, Exception):
+            mock_garmin_user_id.side_effect = user_id_response
+        else:
+            mock_garmin_user_id.side_effect = None
+            mock_garmin_user_id.return_value = user_id_response
+
+        result = process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-037")
+
+        assert result["deregistrations"]["revoked"] == 1
+        task_db.refresh(connection)
+        assert connection.status == ConnectionStatus.REVOKED
+        mock_revoked_webhook.assert_called_once()
+
+    def test_already_revoked_connection_is_not_revoked_again(
+        self,
+        task_db: Session,
+        mock_garmin_user_id: MagicMock,
+        mock_revoked_webhook: MagicMock,
+    ) -> None:
+        """The ping that follows our own disconnect must not emit a second connection.revoked."""
+        UserConnectionFactory(
+            user=UserFactory(),
+            provider="garmin",
+            provider_user_id="garmin_user_123",
+            status=ConnectionStatus.REVOKED,
+            access_token=None,
+            refresh_token=None,
+        )
+
+        result = process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-038")
+
+        assert result["deregistrations"]["revoked"] == 0
+        mock_garmin_user_id.assert_not_called()
+        mock_revoked_webhook.assert_not_called()
+
+    def test_dead_refresh_token_revokes_once_as_deregistration(
+        self,
+        task_db: Session,
+        respx_mock: respx.MockRouter,
+        mock_garmin_user_id: MagicMock,
+        mock_revoked_webhook: MagicMock,
+    ) -> None:
+        """Push tokens are usually expired by the time Garmin deregisters the user. The refresh must
+        not revoke with "refresh_failed" first, or integrators get a misleading reason."""
+        connection = UserConnectionFactory(
+            user=UserFactory(),
+            provider="garmin",
+            provider_user_id="garmin_user_123",
+            token_expires_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        refresh = respx_mock.post(GARMIN_TOKEN_URL).respond(400)
+
+        with patch(f"{BASE_OAUTH_MODULE}.on_connection_revoked", autospec=True) as mock_refresh_revoked_webhook:
+            result = process_webhook_push.run(
+                "garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-039"
+            )
+
+        assert refresh.call_count == 1
+        assert result["deregistrations"]["revoked"] == 1
+        task_db.refresh(connection)
+        assert connection.status == ConnectionStatus.REVOKED
+        mock_garmin_user_id.assert_not_called()
+        mock_refresh_revoked_webhook.assert_not_called()
+        mock_revoked_webhook.assert_called_once()
+        assert mock_revoked_webhook.call_args.kwargs["reason"] == "deregistration"
+
     def test_push_webhook_deregistration_unknown_user(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Test deregistration with unknown user returns 200 with error info."""
         # Arrange - no user connection created
@@ -715,7 +857,6 @@ class TestGarminDeregistrationWebhook:
     def test_push_webhook_deregistration_invalid_entries(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Malformed deregistration entries (non-dict, missing userId) are skipped with errors."""
         payload = {
@@ -736,7 +877,6 @@ class TestGarminDeregistrationWebhook:
     def test_push_webhook_deregistration_not_a_list(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Non-list deregistrations payload is rejected with a format error."""
         result = process_webhook_push.run("garmin", {"deregistrations": "not_a_list"}, "trace-035b")
@@ -751,13 +891,12 @@ class TestGarminTaskRetry:
     def test_push_retries_on_unexpected_error(
         self,
         task_db: Session,
-        mock_external_apis: dict[str, MagicMock],
     ) -> None:
         """Unhandled exception in process_push triggers self.retry, raising Retry."""
         retry_exc = Retry("will retry", RuntimeError("critical failure"))
         with (
-            patch.object(process_webhook_push, "retry", return_value=retry_exc) as mock_retry,
-            patch(f"{MODULE}.ProviderFactory") as mock_factory_cls,
+            patch.object(process_webhook_push, "retry", autospec=True, return_value=retry_exc) as mock_retry,
+            patch(f"{MODULE}.ProviderFactory", create_autospec(ProviderFactory)) as mock_factory_cls,
         ):
             mock_factory_cls.return_value.get_provider.side_effect = RuntimeError("critical failure")
             with pytest.raises(Retry):

@@ -15,6 +15,8 @@ from typing import get_args
 from uuid import uuid4
 
 import pytest
+from psycopg.errors import ForeignKeyViolation
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import DETAIL_MODELS, DetailType, EventRecordDetail, SleepDetails, WorkoutDetails
@@ -58,6 +60,17 @@ class TestEventRecordDetailRepository:
         assert result.heart_rate_max == 175
         assert result.heart_rate_min == 95
         assert result.steps_count == 8500
+
+    def test_a_resync_keeps_the_values_it_does_not_carry(self, db: Session) -> None:
+        """Garmin sends a workout's steps from one endpoint and its speed from another; both stay."""
+        event_record = EventRecordFactory(category="workout")
+        repo = EventRecordDetailRepository(EventRecordDetail)
+
+        repo.bulk_create(db, [EventRecordDetailCreate(record_id=event_record.id, steps_count=8500)])
+        repo.bulk_create(db, [EventRecordDetailCreate(record_id=event_record.id, average_speed=Decimal("2.5"))])
+
+        stored = db.query(WorkoutDetails).filter(WorkoutDetails.record_id == event_record.id).one()
+        assert (stored.steps_count, stored.average_speed) == (8500, Decimal("2.5"))
 
     def test_create_sleep_details(self, db: Session, detail_repo: EventRecordDetailRepository) -> None:
         """Test creating sleep details."""
@@ -108,6 +121,85 @@ class TestEventRecordDetailRepository:
         # Act & Assert
         with pytest.raises(ValueError, match="Unknown detail type: invalid"):
             detail_repo.create(db, detail_data, detail_type="invalid")
+
+    def test_create_duplicate_refreshes_existing(self, db: Session) -> None:
+        """Re-syncing the same record_id refreshes the existing detail instead of raising (#1608).
+
+        Regression for #1375: production wires the repo with the abstract
+        ``EventRecordDetail`` base, so the old ``@handle_duplicates`` recovery blew up
+        with ``NoInspectionAvailable`` on the unique-violation retry.
+        """
+        # Arrange - repo built with the abstract base, mirroring production wiring
+        repo = EventRecordDetailRepository(EventRecordDetail)
+        event_record = EventRecordFactory(category="workout")
+        first = repo.create(
+            db,
+            EventRecordDetailCreate(record_id=event_record.id, steps_count=8500),
+            detail_type="workout",
+        )
+
+        # Act - inserting the same record_id again must not raise
+        duplicate = repo.create(
+            db,
+            EventRecordDetailCreate(record_id=event_record.id, steps_count=9999),
+            detail_type="workout",
+        )
+
+        # Assert - the same row, carrying the re-synced value
+        assert isinstance(duplicate, WorkoutDetails)
+        assert duplicate.record_id == first.record_id
+        assert duplicate.steps_count == 9999
+
+    def test_create_and_flush_duplicate_returns_existing(self, db: Session) -> None:
+        """create_and_flush is idempotent on record_id via its savepoint recovery."""
+        # Arrange
+        repo = EventRecordDetailRepository(EventRecordDetail)
+        event_record = EventRecordFactory(category="workout")
+        first = repo.create(
+            db,
+            EventRecordDetailCreate(record_id=event_record.id, steps_count=8500),
+            detail_type="workout",
+        )
+
+        # Act
+        duplicate = repo.create_and_flush(
+            db,
+            EventRecordDetailCreate(record_id=event_record.id, steps_count=9999),
+            detail_type="workout",
+        )
+
+        # Assert
+        assert isinstance(duplicate, WorkoutDetails)
+        assert duplicate.record_id == first.record_id
+        assert duplicate.steps_count == 8500
+
+    def test_create_unrelated_integrity_error_reraises(
+        self,
+        db: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A non-duplicate IntegrityError must surface even when a detail row already exists."""
+        # Arrange
+        repo = EventRecordDetailRepository(EventRecordDetail)
+        event_record = EventRecordFactory(category="workout")
+        repo.create(
+            db,
+            EventRecordDetailCreate(record_id=event_record.id, steps_count=8500),
+            detail_type="workout",
+        )
+
+        def fail_with_fk_violation() -> None:
+            raise IntegrityError("stmt", {}, ForeignKeyViolation("fk violation"))
+
+        monkeypatch.setattr(db, "commit", fail_with_fk_violation)
+
+        # Act & Assert - the error is re-raised, no silent recovery
+        with pytest.raises(IntegrityError):
+            repo.create(
+                db,
+                EventRecordDetailCreate(record_id=event_record.id, steps_count=9999),
+                detail_type="workout",
+            )
 
     def test_get_by_record_id_workout(self, db: Session, detail_repo: EventRecordDetailRepository) -> None:
         """Test getting workout details by record_id."""

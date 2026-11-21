@@ -4,56 +4,65 @@ Tests for process_aws_upload Celery task.
 Tests XML file processing from S3 for Apple Health data imports.
 """
 
-import os
+from io import BytesIO
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
+from botocore.exceptions import ClientError
+from psycopg.errors import ForeignKeyViolation, NotNullViolation, UniqueViolation
+from pytest_mock import MockerFixture
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.process_aws_upload_task import (
     _import_xml_data,
+    _is_retryable,
+    complete_and_process_aws_upload,
     process_aws_upload,
 )
+from app.models import EventRecord, User
+from app.schemas.model_crud.activities.data_point_series import TimeSeriesSampleCreate
+from app.schemas.model_crud.activities.event_record import EventRecordCreate
+from app.schemas.model_crud.activities.event_record_detail import EventRecordDetailCreate
+from app.schemas.providers.apple.apple_xml import CompletedPart
+from app.utils.exceptions import AppError, InvalidInputError, NotFoundError, ServiceUnavailableError
 from tests.factories import UserFactory
+from tests.utils.aws import mock_s3_client
 
 
 class TestProcessUploadTask:
     """Test suite for process_aws_upload task."""
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.SessionLocal")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.get_s3_client")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task._import_xml_data")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.user_service")
-    def test_process_aws_upload_success(
-        self,
-        mock_user_service: MagicMock,
-        mock_import_xml_data: MagicMock,
-        mock_get_s3_client: MagicMock,
-        mock_session_local: MagicMock,
-        db: Session,
-        mock_celery_app: MagicMock,
-    ) -> None:
+    def test_process_aws_upload_success(self, mocker: MockerFixture, db: Session) -> None:
         """Test successful processing of uploaded XML file."""
+        mock_user_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.user_service", autospec=True
+        )
+        mock_import_xml_data = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task._import_xml_data", autospec=True
+        )
+        mock_get_s3_client = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.get_s3_client", autospec=True
+        )
+        mock_session_local = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.SessionLocal", autospec=True
+        )
         # Arrange
         user = UserFactory()
         bucket_name = "test-bucket"
         object_key = f"uploads/{user.id}/apple-health/export.xml"
 
-        mock_s3 = MagicMock()
+        mock_s3 = mock_s3_client()
         mock_get_s3_client.return_value = mock_s3
 
         mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
         mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
         mock_user_service.get.return_value = user
 
-        # Mock S3 download
-        def mock_download(bucket: str, key: str, local_path: str) -> None:
-            # Create a dummy file
-            with open(local_path, "w") as f:
-                f.write("<HealthData></HealthData>")
-
-        mock_s3.download_file.side_effect = mock_download
+        body = BytesIO(b"<HealthData></HealthData>")
+        mock_s3.get_object.return_value = {"Body": body}
 
         # Act
         result = process_aws_upload(bucket_name, object_key, str(user.id))
@@ -65,109 +74,94 @@ class TestProcessUploadTask:
         assert result["user_id"] == str(user.id)
         assert result["message"] == "Import completed successfully"
 
-        # Verify S3 download was called
-        mock_s3.download_file.assert_called_once()
-        call_args = mock_s3.download_file.call_args[0]
-        assert call_args[0] == bucket_name
-        assert call_args[1] == object_key
+        mock_s3.get_object.assert_called_once_with(Bucket=bucket_name, Key=object_key)
+        assert body.closed
 
         # Verify import was called
         mock_import_xml_data.assert_called_once()
+        assert mock_import_xml_data.call_args.args[1] is body
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.SessionLocal")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.get_s3_client")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task._import_xml_data")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.user_service")
-    def test_process_aws_upload_cleans_up_temp_file(
-        self,
-        mock_user_service: MagicMock,
-        mock_import_xml_data: MagicMock,
-        mock_get_s3_client: MagicMock,
-        mock_session_local: MagicMock,
-        db: Session,
-        mock_celery_app: MagicMock,
-    ) -> None:
-        """Test that temporary file is cleaned up after processing."""
+    def test_process_aws_upload_closes_object_stream(self, mocker: MockerFixture, db: Session) -> None:
+        """Test that the S3 response stream is closed after processing."""
+        mock_user_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.user_service", autospec=True
+        )
+        mocker.patch("app.integrations.celery.tasks.process_aws_upload_task._import_xml_data", autospec=True)
+        mock_get_s3_client = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.get_s3_client", autospec=True
+        )
+        mock_session_local = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.SessionLocal", autospec=True
+        )
         # Arrange
         user = UserFactory()
         bucket_name = "test-bucket"
         object_key = f"uploads/{user.id}/apple-health/export.xml"
 
-        mock_s3 = MagicMock()
+        mock_s3 = mock_s3_client()
         mock_get_s3_client.return_value = mock_s3
 
         mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
         mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
         mock_user_service.get.return_value = user
 
-        temp_file_path = None
-
-        def mock_download(bucket: str, key: str, local_path: str) -> None:
-            nonlocal temp_file_path
-            temp_file_path = local_path
-            with open(local_path, "w") as f:
-                f.write("<HealthData></HealthData>")
-
-        mock_s3.download_file.side_effect = mock_download
+        body = BytesIO(b"<HealthData></HealthData>")
+        mock_s3.get_object.return_value = {"Body": body}
 
         # Act
         process_aws_upload(bucket_name, object_key, str(user.id))
 
-        # Assert - temp file should be cleaned up
-        assert temp_file_path is not None
-        assert not os.path.exists(temp_file_path)
+        assert body.closed
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.SessionLocal")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.get_s3_client")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.user_service")
-    def test_process_aws_upload_s3_download_error(
-        self,
-        mock_user_service: MagicMock,
-        mock_get_s3_client: MagicMock,
-        mock_session_local: MagicMock,
-        db: Session,
-        mock_celery_app: MagicMock,
-    ) -> None:
+    def test_process_aws_upload_s3_download_error(self, mocker: MockerFixture, db: Session) -> None:
         """Test handling of S3 download errors."""
+        mock_user_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.user_service", autospec=True
+        )
+        mock_get_s3_client = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.get_s3_client", autospec=True
+        )
+        mock_session_local = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.SessionLocal", autospec=True
+        )
         # Arrange
         user = UserFactory()
         bucket_name = "test-bucket"
         object_key = f"uploads/{user.id}/apple-health/export.xml"
 
-        mock_s3 = MagicMock()
+        mock_s3 = mock_s3_client()
         mock_get_s3_client.return_value = mock_s3
 
         mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
         mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
         mock_user_service.get.return_value = user
 
-        # Mock S3 download to fail
-        mock_s3.download_file.side_effect = Exception("S3 connection failed")
+        mock_s3.get_object.side_effect = Exception("S3 connection failed")
 
         # Act & Assert
         with pytest.raises(Exception, match="S3 connection failed"):
             process_aws_upload(bucket_name, object_key, str(user.id))
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.SessionLocal")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.get_s3_client")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task._import_xml_data")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.user_service")
-    def test_process_aws_upload_import_error_rolls_back(
-        self,
-        mock_user_service: MagicMock,
-        mock_import_xml_data: MagicMock,
-        mock_get_s3_client: MagicMock,
-        mock_session_local: MagicMock,
-        db: Session,
-        mock_celery_app: MagicMock,
-    ) -> None:
+    def test_process_aws_upload_import_error_rolls_back(self, mocker: MockerFixture, db: Session) -> None:
         """Test that database transaction is rolled back on import error."""
+        mock_user_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.user_service", autospec=True
+        )
+        mock_import_xml_data = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task._import_xml_data", autospec=True
+        )
+        mock_get_s3_client = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.get_s3_client", autospec=True
+        )
+        mock_session_local = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.SessionLocal", autospec=True
+        )
         # Arrange
         user = UserFactory()
         bucket_name = "test-bucket"
         object_key = f"uploads/{user.id}/apple-health/export.xml"
 
-        mock_s3 = MagicMock()
+        mock_s3 = mock_s3_client()
         mock_get_s3_client.return_value = mock_s3
 
         mock_db = MagicMock(spec=Session)
@@ -175,11 +169,8 @@ class TestProcessUploadTask:
         mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
         mock_user_service.get.return_value = user
 
-        def mock_download(bucket: str, key: str, local_path: str) -> None:
-            with open(local_path, "w") as f:
-                f.write("<HealthData></HealthData>")
-
-        mock_s3.download_file.side_effect = mock_download
+        body = BytesIO(b"<HealthData></HealthData>")
+        mock_s3.get_object.return_value = {"Body": body}
 
         # Mock import to fail
         mock_import_xml_data.side_effect = Exception("XML parsing error")
@@ -190,38 +181,33 @@ class TestProcessUploadTask:
 
         # Verify rollback was called
         mock_db.rollback.assert_called_once()
+        assert body.closed
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.SessionLocal")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.get_s3_client")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task._import_xml_data")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.user_service")
-    def test_process_aws_upload_extracts_user_id_from_key(
-        self,
-        mock_user_service: MagicMock,
-        mock_import_xml_data: MagicMock,
-        mock_get_s3_client: MagicMock,
-        mock_session_local: MagicMock,
-        db: Session,
-        mock_celery_app: MagicMock,
-    ) -> None:
+    def test_process_aws_upload_extracts_user_id_from_key(self, mocker: MockerFixture, db: Session) -> None:
         """Test that user ID is correctly extracted from object key."""
+        mock_user_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.user_service", autospec=True
+        )
+        mocker.patch("app.integrations.celery.tasks.process_aws_upload_task._import_xml_data", autospec=True)
+        mock_get_s3_client = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.get_s3_client", autospec=True
+        )
+        mock_session_local = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.SessionLocal", autospec=True
+        )
         # Arrange
         user_id = "550e8400-e29b-41d4-a716-446655440000"
         bucket_name = "test-bucket"
         object_key = f"uploads/{user_id}/apple-health/export.xml"
 
-        mock_s3 = MagicMock()
+        mock_s3 = mock_s3_client()
         mock_get_s3_client.return_value = mock_s3
 
         mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
         mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
-        mock_user_service.get.return_value = MagicMock()
+        mock_user_service.get.return_value = User()
 
-        def mock_download(bucket: str, key: str, local_path: str) -> None:
-            with open(local_path, "w") as f:
-                f.write("<HealthData></HealthData>")
-
-        mock_s3.download_file.side_effect = mock_download
+        mock_s3.get_object.return_value = {"Body": BytesIO(b"<HealthData></HealthData>")}
 
         # Act
         result = process_aws_upload(bucket_name, object_key, user_id)
@@ -229,37 +215,205 @@ class TestProcessUploadTask:
         # Assert
         assert result["user_id"] == user_id
 
+    def test_complete_and_process_owns_both_operations(self, mocker: MockerFixture) -> None:
+        mock_multipart_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.multipart_upload_service", autospec=True
+        )
+        mock_process = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task._process_aws_upload", autospec=True
+        )
+        key = "user-123/raw/export.xml"
+        mock_process.return_value = {"status": "success"}
+
+        result = complete_and_process_aws_upload(
+            bucket_name="test-bucket",
+            object_key=key,
+            upload_id="upload-1",
+            parts=[{"part_number": 1, "etag": "etag-1"}],
+            user_id="user-123",
+        )
+
+        assert result == {"status": "success"}
+        mock_multipart_service.complete_upload.assert_called_once_with(
+            user_id="user-123",
+            key=key,
+            upload_id="upload-1",
+            parts=[CompletedPart(part_number=1, etag="etag-1")],
+            bucket_name="test-bucket",
+        )
+        mock_process.assert_called_once_with("test-bucket", key, "user-123")
+
+    def test_success_marker_suppresses_duplicate_processing(self, mocker: MockerFixture) -> None:
+        mock_process = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task._process_aws_upload", autospec=True
+        )
+        mock_process.return_value = {
+            "bucket": "test-bucket",
+            "input_key": "user-123/raw/export.xml",
+            "user_id": "user-123",
+            "status": "success",
+            "message": "Import completed successfully",
+        }
+
+        first = process_aws_upload("test-bucket", "user-123/raw/export.xml", "user-123")
+        second = process_aws_upload("test-bucket", "user-123/raw/export.xml", "user-123")
+
+        assert second == first
+        mock_process.assert_called_once_with("test-bucket", "user-123/raw/export.xml", "user-123")
+
+    def test_retry_after_processing_failure_skips_consumed_upload_id(self, mocker: MockerFixture) -> None:
+        mock_multipart_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.multipart_upload_service", autospec=True
+        )
+        mock_process = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task._process_aws_upload", autospec=True
+        )
+        key = "user-123/raw/export.xml"
+        success = {"status": "success", "message": "Import completed successfully"}
+        mock_process.side_effect = [RuntimeError("temporary database failure"), success]
+
+        with pytest.raises(RuntimeError, match="temporary database failure"):
+            complete_and_process_aws_upload(
+                bucket_name="test-bucket",
+                object_key=key,
+                upload_id="upload-1",
+                parts=[{"part_number": 1, "etag": "etag-1"}],
+                user_id="user-123",
+            )
+
+        result = complete_and_process_aws_upload(
+            bucket_name="test-bucket",
+            object_key=key,
+            upload_id="upload-1",
+            parts=[{"part_number": 1, "etag": "etag-1"}],
+            user_id="user-123",
+        )
+
+        assert result == success
+        mock_multipart_service.complete_upload.assert_called_once()
+        assert mock_process.call_count == 2
+
+    def test_process_aws_upload_skips_a_missing_user(self, mocker: MockerFixture, db: Session) -> None:
+        """A user deleted before the import is skipped without downloading the export."""
+        mock_get_s3_client = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.get_s3_client", autospec=True
+        )
+        mock_session_local = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.SessionLocal", autospec=True
+        )
+        # Arrange
+        mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
+        mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
+        missing_user_id = str(uuid4())
+
+        # Act
+        result = process_aws_upload("test-bucket", f"{missing_user_id}/raw/export.xml", missing_user_id)
+
+        # Assert
+        assert result["status"] == "skipped"
+        mock_get_s3_client.return_value.get_object.assert_not_called()
+
+    def test_object_processing_tasks_use_late_ack_and_retries(self) -> None:
+        assert process_aws_upload.acks_late is True
+        assert process_aws_upload.reject_on_worker_lost is True
+        assert process_aws_upload.max_retries == 3
+        assert complete_and_process_aws_upload.acks_late is True
+        assert complete_and_process_aws_upload.reject_on_worker_lost is True
+        assert complete_and_process_aws_upload.max_retries == 3
+
+    def test_complete_is_idempotent_when_upload_already_finalized(self, mocker: MockerFixture) -> None:
+        """A duplicate delivery finds the upload already completed (404) but the object
+        present, so it must still process instead of failing on the consumed upload id."""
+        mock_multipart_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.multipart_upload_service", autospec=True
+        )
+        mock_get_s3_client = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.get_s3_client", autospec=True
+        )
+        mock_process = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task._process_aws_upload", autospec=True
+        )
+        key = "user-123/raw/export.xml"
+        mock_multipart_service.complete_upload.side_effect = NotFoundError(
+            "Failed to complete multipart upload: NoSuchUpload"
+        )
+        mock_s3 = mock_s3_client()
+        mock_s3.head_object.return_value = {}  # object exists -> completion already happened
+        mock_get_s3_client.return_value = mock_s3
+        mock_process.return_value = {"status": "success"}
+
+        result = complete_and_process_aws_upload(
+            bucket_name="test-bucket",
+            object_key=key,
+            upload_id="upload-1",
+            parts=[{"part_number": 1, "etag": "etag-1"}],
+            user_id="user-123",
+        )
+
+        assert result == {"status": "success"}
+        mock_s3.head_object.assert_called_once_with(Bucket="test-bucket", Key=key)
+        mock_process.assert_called_once_with("test-bucket", key, "user-123")
+
+    def test_complete_404_without_object_propagates(self, mocker: MockerFixture) -> None:
+        """A genuine 404 (no finalized object) must not be swallowed, and must not process."""
+        mock_multipart_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.multipart_upload_service", autospec=True
+        )
+        mock_get_s3_client = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.get_s3_client", autospec=True
+        )
+        mock_process = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task._process_aws_upload", autospec=True
+        )
+        key = "user-123/raw/export.xml"
+        mock_multipart_service.complete_upload.side_effect = NotFoundError(
+            "Failed to complete multipart upload: NoSuchUpload"
+        )
+        mock_s3 = mock_s3_client()
+        mock_s3.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
+        mock_get_s3_client.return_value = mock_s3
+
+        with pytest.raises(NotFoundError):
+            complete_and_process_aws_upload(
+                bucket_name="test-bucket",
+                object_key=key,
+                upload_id="upload-1",
+                parts=[{"part_number": 1, "etag": "etag-1"}],
+                user_id="user-123",
+            )
+
+        mock_process.assert_not_called()
+
 
 class TestImportXmlData:
     """Test suite for _import_xml_data helper function."""
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.XMLService")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.event_record_service")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.timeseries_service")
-    def test_import_xml_data_creates_records(
-        self,
-        mock_timeseries_service: MagicMock,
-        mock_event_record_service: MagicMock,
-        mock_xml_service_class: MagicMock,
-        db: Session,
-    ) -> None:
+    def test_import_xml_data_creates_records(self, mocker: MockerFixture, db: Session) -> None:
         """Test that XML data is properly imported into database."""
+        mock_timeseries_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.timeseries_service", autospec=True
+        )
+        mock_event_record_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.event_record_service", autospec=True
+        )
+        mock_xml_service_class = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.XMLService", autospec=True
+        )
         # Arrange
         user = UserFactory()
         xml_path = "/tmp/test.xml"
 
         # Mock XMLService to yield test data (time_series_records, workouts)
-        mock_record = MagicMock()
-        mock_detail = MagicMock()
-        mock_time_series_records = [MagicMock(), MagicMock()]
-        mock_created_record = MagicMock()
+        mock_record = MagicMock(spec=EventRecordCreate)
+        mock_detail = MagicMock(spec=EventRecordDetailCreate)
+        mock_time_series_records = [MagicMock(spec=TimeSeriesSampleCreate), MagicMock(spec=TimeSeriesSampleCreate)]
+        mock_created_record = EventRecord(id=uuid4())
         mock_event_record_service.create.return_value = mock_created_record
 
-        mock_xml_service = MagicMock()
+        mock_xml_service = mock_xml_service_class.return_value
         mock_xml_service.parse_xml.return_value = [
             (mock_time_series_records, [(mock_record, mock_detail)], None),
         ]
-        mock_xml_service_class.return_value = mock_xml_service
 
         # Act
         _import_xml_data(db, xml_path, str(user.id))
@@ -269,30 +423,27 @@ class TestImportXmlData:
         mock_event_record_service.create_detail.assert_called_once()
         mock_timeseries_service.bulk_create_samples.assert_called_once_with(db, mock_time_series_records)
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.XMLService")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.event_record_service")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.timeseries_service")
-    def test_import_xml_data_handles_multiple_workouts(
-        self,
-        mock_timeseries_service: MagicMock,
-        mock_event_record_service: MagicMock,
-        mock_xml_service_class: MagicMock,
-        db: Session,
-    ) -> None:
+    def test_import_xml_data_handles_multiple_workouts(self, mocker: MockerFixture, db: Session) -> None:
         """Test importing XML data with multiple workouts."""
+        mocker.patch("app.integrations.celery.tasks.process_aws_upload_task.timeseries_service", autospec=True)
+        mock_event_record_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.event_record_service", autospec=True
+        )
+        mock_xml_service_class = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.XMLService", autospec=True
+        )
         # Arrange
         user = UserFactory()
         xml_path = "/tmp/test.xml"
 
         # Mock XMLService to yield multiple workouts (time_series_records, workouts)
-        workout1 = (MagicMock(), MagicMock())
-        workout2 = (MagicMock(), MagicMock())
-        mock_created_record = MagicMock()
+        workout1 = (MagicMock(spec=EventRecordCreate), MagicMock(spec=EventRecordDetailCreate))
+        workout2 = (MagicMock(spec=EventRecordCreate), MagicMock(spec=EventRecordDetailCreate))
+        mock_created_record = EventRecord(id=uuid4())
         mock_event_record_service.create.return_value = mock_created_record
 
-        mock_xml_service = MagicMock()
+        mock_xml_service = mock_xml_service_class.return_value
         mock_xml_service.parse_xml.return_value = [([], [workout1, workout2], None)]
-        mock_xml_service_class.return_value = mock_xml_service
 
         # Act
         _import_xml_data(db, xml_path, str(user.id))
@@ -301,27 +452,26 @@ class TestImportXmlData:
         assert mock_event_record_service.create.call_count == 2
         assert mock_event_record_service.create_detail.call_count == 2
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.XMLService")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.event_record_service")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.timeseries_service")
-    def test_import_xml_data_skips_empty_time_series(
-        self,
-        mock_timeseries_service: MagicMock,
-        mock_event_record_service: MagicMock,
-        mock_xml_service_class: MagicMock,
-        db: Session,
-    ) -> None:
+    def test_import_xml_data_skips_empty_time_series(self, mocker: MockerFixture, db: Session) -> None:
         """Test that empty time series data is not imported."""
+        mock_timeseries_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.timeseries_service", autospec=True
+        )
+        mock_event_record_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.event_record_service", autospec=True
+        )
+        mock_xml_service_class = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.XMLService", autospec=True
+        )
         # Arrange
         user = UserFactory()
         xml_path = "/tmp/test.xml"
 
         # Mock XMLService with empty time series (time_series_records, workouts)
-        mock_xml_service = MagicMock()
+        mock_xml_service = mock_xml_service_class.return_value
         mock_xml_service.parse_xml.return_value = [
             ([], [], None),  # Empty time series and workouts
         ]
-        mock_xml_service_class.return_value = mock_xml_service
 
         # Act
         _import_xml_data(db, xml_path, str(user.id))
@@ -330,28 +480,25 @@ class TestImportXmlData:
         mock_timeseries_service.bulk_create_samples.assert_not_called()
         mock_event_record_service.create.assert_not_called()
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.XMLService")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.event_record_service")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.timeseries_service")
-    def test_import_xml_data_with_time_series_only(
-        self,
-        mock_timeseries_service: MagicMock,
-        mock_event_record_service: MagicMock,
-        mock_xml_service_class: MagicMock,
-        db: Session,
-    ) -> None:
+    def test_import_xml_data_with_time_series_only(self, mocker: MockerFixture, db: Session) -> None:
         """Test importing only time series data."""
+        mock_timeseries_service = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.timeseries_service", autospec=True
+        )
+        mocker.patch("app.integrations.celery.tasks.process_aws_upload_task.event_record_service", autospec=True)
+        mock_xml_service_class = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.XMLService", autospec=True
+        )
         # Arrange
         user = UserFactory()
         xml_path = "/tmp/test.xml"
 
-        mock_time_series_records = [MagicMock(), MagicMock(), MagicMock()]
+        mock_time_series_records = [MagicMock(spec=TimeSeriesSampleCreate) for _ in range(3)]
 
-        mock_xml_service = MagicMock()
+        mock_xml_service = mock_xml_service_class.return_value
         mock_xml_service.parse_xml.return_value = [
             (mock_time_series_records, [], None),  # Only time series, no workouts
         ]
-        mock_xml_service_class.return_value = mock_xml_service
 
         # Act
         _import_xml_data(db, xml_path, str(user.id))
@@ -359,22 +506,18 @@ class TestImportXmlData:
         # Assert
         mock_timeseries_service.bulk_create_samples.assert_called_once_with(db, mock_time_series_records)
 
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.XMLService")
-    @patch("app.integrations.celery.tasks.process_aws_upload_task.event_record_service")
-    def test_import_xml_data_xmlservice_receives_correct_params(
-        self,
-        mock_event_record_service: MagicMock,
-        mock_xml_service_class: MagicMock,
-        db: Session,
-    ) -> None:
+    def test_import_xml_data_xmlservice_receives_correct_params(self, mocker: MockerFixture, db: Session) -> None:
         """Test that XMLService is initialized with correct parameters."""
+        mocker.patch("app.integrations.celery.tasks.process_aws_upload_task.event_record_service", autospec=True)
+        mock_xml_service_class = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.XMLService", autospec=True
+        )
         # Arrange
         user = UserFactory()
         xml_path = "/tmp/test.xml"
 
-        mock_xml_service = MagicMock()
+        mock_xml_service = mock_xml_service_class.return_value
         mock_xml_service.parse_xml.return_value = []
-        mock_xml_service_class.return_value = mock_xml_service
 
         # Act
         _import_xml_data(db, xml_path, str(user.id))
@@ -385,3 +528,34 @@ class TestImportXmlData:
         assert str(call_args[0]) == xml_path
         # Verify parse_xml was called with user_id
         mock_xml_service.parse_xml.assert_called_once_with(str(user.id))
+
+    def test_import_xml_data_passes_binary_stream_without_copying(self, mocker: MockerFixture, db: Session) -> None:
+        mock_xml_service_class = mocker.patch(
+            "app.integrations.celery.tasks.process_aws_upload_task.XMLService", autospec=True
+        )
+        user = UserFactory()
+        source = BytesIO(b"<HealthData></HealthData>")
+        mock_xml_service_class.return_value.parse_xml.return_value = []
+
+        _import_xml_data(db, source, str(user.id))
+
+        assert mock_xml_service_class.call_args.args[0] is source
+
+
+@pytest.mark.parametrize(
+    ("exc", "retryable"),
+    [
+        (RuntimeError("temporary database failure"), True),
+        (ServiceUnavailableError("Object storage unavailable"), True),
+        (InvalidInputError("Completed parts do not match"), False),
+        (AppError("broken invariant"), True),
+        (NotFoundError("User not found."), False),
+        (IntegrityError("stmt", {}, UniqueViolation("duplicate key")), False),
+        (ForeignKeyViolation("raw psycopg, from a COPY"), False),
+        # our bug, but just as deterministic: the failed task still reaches Sentry
+        (IntegrityError("stmt", {}, NotNullViolation("null value")), False),
+    ],
+)
+def test_is_retryable(exc: Exception, retryable: bool) -> None:
+    """Client errors and constraint violations fail the same way on every attempt."""
+    assert _is_retryable(exc) is retryable

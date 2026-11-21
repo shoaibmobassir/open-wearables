@@ -7,13 +7,25 @@ Tests the following endpoints:
 """
 
 from typing import Generator
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.schemas.auth import ConnectionStatus
+from app.services.providers.base_strategy import BaseProviderStrategy
+from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
+from app.utils.exceptions import (
+    AppError,
+    ProviderAuthRejectedError,
+    ProviderError,
+    ProviderNotConnectedError,
+    ProviderRateLimitError,
+    ProviderTokenUnavailableError,
+    ReauthRequiredError,
+)
 from tests.factories import ApiKeyFactory, UserConnectionFactory, UserFactory
 
 
@@ -23,8 +35,9 @@ class TestVendorWorkoutsEndpoints:
     @pytest.fixture
     def mock_provider_factory(self) -> Generator[MagicMock, None, None]:
         """Mock the ProviderFactory to avoid external API calls."""
-        with patch("app.api.routes.v1.vendor_workouts.factory") as mock_factory:
-            mock_strategy = MagicMock()
+        with patch("app.api.routes.v1.vendor_workouts.factory", autospec=True) as mock_factory:
+            mock_strategy = create_autospec(BaseProviderStrategy, instance=True)
+            mock_strategy.workouts = create_autospec(BaseWorkoutsTemplate, instance=True)
             mock_strategy.workouts.get_workouts_from_api.return_value = [
                 {"id": "123", "type": "running", "duration": 3600},
                 {"id": "456", "type": "cycling", "duration": 1800},
@@ -53,7 +66,7 @@ class TestVendorWorkoutsEndpoints:
         # Act
         response = client.get(
             f"/api/v1/providers/garmin/users/{user.id}/workouts",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
         )
 
         # Assert
@@ -88,22 +101,60 @@ class TestVendorWorkoutsEndpoints:
         api_key = ApiKeyFactory()
         # No connection created for this user
 
-        # Configure mock to raise HTTPException for no connection
-        from fastapi import HTTPException
-
-        mock_provider_factory.get_provider.return_value.workouts.get_workouts_from_api.side_effect = HTTPException(
-            status_code=404,
-            detail="No active connection found for user",
+        mock_provider_factory.get_provider.return_value.workouts.get_workouts_from_api.side_effect = (
+            ProviderNotConnectedError("garmin")
         )
 
         # Act
         response = client.get(
             f"/api/v1/providers/garmin/users/{user.id}/workouts",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
         )
 
         # Assert
         assert response.status_code == 404
+        assert response.json()["detail"] == "User is not connected to Garmin."
+
+    @pytest.mark.parametrize(
+        ("error", "status", "detail"),
+        [
+            (
+                ReauthRequiredError("garmin", uuid4(), "revoked"),
+                409,
+                "Garmin authorization expired or was revoked; the user must reconnect.",
+            ),
+            (ProviderAuthRejectedError("garmin"), 502, "Garmin API error (status 401)"),
+            (ProviderTokenUnavailableError("garmin"), 400, "No Garmin API access token for this user."),
+            (
+                ProviderError("garmin", upstream_status=500, upstream_body="upstream stack trace"),
+                502,
+                "Garmin API error (status 500)",
+            ),
+            (ProviderRateLimitError("garmin", upstream_status=429), 503, "Garmin API error (status 429)"),
+        ],
+    )
+    def test_get_workouts_provider_failure(
+        self,
+        client: TestClient,
+        db: Session,
+        mock_provider_factory: MagicMock,
+        error: AppError,
+        status: int,
+        detail: str,
+    ) -> None:
+        """A provider failure is never a 401, which would read as a bad API key."""
+        user = UserFactory()
+        api_key = ApiKeyFactory()
+        mock_provider_factory.get_provider.return_value.workouts.get_workouts_from_api.side_effect = error
+
+        response = client.get(
+            f"/api/v1/providers/garmin/users/{user.id}/workouts",
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
+        )
+
+        assert response.status_code == status
+        assert response.json()["detail"] == detail
+        assert response.json()["code"] == error.code
 
     def test_get_polar_workouts_success(
         self,
@@ -120,7 +171,7 @@ class TestVendorWorkoutsEndpoints:
         # Act
         response = client.get(
             f"/api/v1/providers/polar/users/{user.id}/workouts",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
         )
 
         # Assert
@@ -144,7 +195,7 @@ class TestVendorWorkoutsEndpoints:
         # Act
         response = client.get(
             f"/api/v1/providers/polar/users/{user.id}/workouts",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             params={"samples": True, "zones": True, "route": True},
         )
 
@@ -171,7 +222,7 @@ class TestVendorWorkoutsEndpoints:
         # Act
         response = client.get(
             f"/api/v1/providers/suunto/users/{user.id}/workouts",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
         )
 
         # Assert
@@ -195,7 +246,7 @@ class TestVendorWorkoutsEndpoints:
         # Act
         response = client.get(
             f"/api/v1/providers/suunto/users/{user.id}/workouts",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             params={"since": 1609459200, "limit": 25, "offset": 10},
         )
 
@@ -223,7 +274,7 @@ class TestVendorWorkoutsEndpoints:
         # Act
         response = client.get(
             f"/api/v1/providers/garmin/users/{user.id}/workouts/{workout_id}",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
         )
 
         # Assert
@@ -247,24 +298,23 @@ class TestVendorWorkoutsEndpoints:
         workout_id = "nonexistent"
         UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.ACTIVE)
 
-        # Configure mock to raise HTTPException for not found
-        from fastapi import HTTPException
-
+        # The provider answers 404; its body is not passed through
         mock_provider_factory.get_provider.return_value.workouts.get_workout_detail_from_api.side_effect = (
-            HTTPException(status_code=404, detail="Workout not found")
+            ProviderError("garmin", upstream_status=404, upstream_body='{"message": "Workout not found"}')
         )
 
         # Act
         response = client.get(
             f"/api/v1/providers/garmin/users/{user.id}/workouts/{workout_id}",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
         )
 
-        # Assert
+        # Assert: the client's id, so a 404 and not a 502 that reads "retry later"
         assert response.status_code == 404
+        assert response.json()["detail"] == "Workout not found"
 
     def test_invalid_provider_returns_422(self, client: TestClient, db: Session) -> None:
-        """Test that invalid provider enum value returns 400."""
+        """Test that invalid provider enum value returns 422."""
         # Arrange
         user = UserFactory()
         api_key = ApiKeyFactory()
@@ -272,11 +322,11 @@ class TestVendorWorkoutsEndpoints:
         # Act
         response = client.get(
             f"/api/v1/providers/invalid_provider/users/{user.id}/workouts",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
         )
 
         # Assert
-        assert response.status_code == 400
+        assert response.status_code == 422
 
     def test_provider_not_supporting_workouts(self, client: TestClient, db: Session) -> None:
         """Test provider that doesn't support workouts returns 501."""
@@ -286,15 +336,15 @@ class TestVendorWorkoutsEndpoints:
         UserConnectionFactory(user=user, provider="apple", status=ConnectionStatus.ACTIVE)
 
         # Mock factory to return a strategy without workouts
-        with patch("app.api.routes.v1.vendor_workouts.factory") as mock_factory:
-            mock_strategy = MagicMock()
+        with patch("app.api.routes.v1.vendor_workouts.factory", autospec=True) as mock_factory:
+            mock_strategy = create_autospec(BaseProviderStrategy, instance=True)
             mock_strategy.workouts = None  # Apple has no cloud API
             mock_factory.get_provider.return_value = mock_strategy
 
             # Act
             response = client.get(
                 f"/api/v1/providers/apple/users/{user.id}/workouts",
-                headers={"X-Open-Wearables-API-Key": api_key.id},
+                headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             )
 
             # Assert

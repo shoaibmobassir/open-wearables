@@ -137,6 +137,9 @@ class OpenWearablesClient:
             "start_date": start_date,
             "end_date": end_date,
             "limit": limit,
+            # The same workout often arrives from several providers (e.g. Strava and Apple Health);
+            # keep only the highest-priority copy so counts, durations and calories are not doubled.
+            "source_selection": "per_session",
         }
         if record_type:
             params["record_type"] = record_type
@@ -186,7 +189,7 @@ class OpenWearablesClient:
             start_time: Start of the window (ISO-8601, e.g. "2026-04-05T00:00:00Z")
             end_time: End of the window (ISO-8601, e.g. "2026-04-05T23:59:59Z")
             types: SeriesType codes to include (e.g. ["heart_rate", "oxygen_saturation"])
-            resolution: One of "raw", "1min", "5min", "15min", "1hour"
+            resolution: One of "raw", "1min", "5min", "15min", "1hour", "1day", "1week", "1month"
             limit: Page size (1-100)
             cursor: Opaque pagination cursor returned by a previous call
 
@@ -203,6 +206,36 @@ class OpenWearablesClient:
         if cursor:
             params["cursor"] = cursor
         return await self._request("GET", f"/api/v1/users/{user_id}/timeseries", params=params)
+
+    async def get_menstrual_cycles(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Get menstrual cycle records for a user within a date range.
+
+        Args:
+            user_id: UUID of the user
+            start_date: Start date (YYYY-MM-DD format)
+            end_date: End date (YYYY-MM-DD format)
+            limit: Page size (1-100)
+            cursor: Opaque pagination cursor returned by a previous call
+
+        Returns:
+            Paginated response with menstrual cycle records
+        """
+        params: dict[str, Any] = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "limit": limit,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", f"/api/v1/users/{user_id}/events/menstrual-cycles", params=params)
 
 
 # Singleton instance

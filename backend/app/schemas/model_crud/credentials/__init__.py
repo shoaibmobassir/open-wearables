@@ -1,6 +1,7 @@
 from .api_key import (
     ApiKeyCreate,
     ApiKeyRead,
+    ApiKeyReadWithSecret,
     ApiKeyUpdate,
 )
 from .application import (
@@ -12,6 +13,7 @@ from .application import (
 )
 from .oauth import (
     AuthorizationURLResponse,
+    ConnectTokenResponse,
     OAuthState,
     OAuthTokenResponse,
     ProviderCredentials,
@@ -27,6 +29,7 @@ from .user_invitation_code import (
 __all__ = [
     # ApiKey
     "ApiKeyRead",
+    "ApiKeyReadWithSecret",
     "ApiKeyCreate",
     "ApiKeyUpdate",
     # Application
@@ -41,6 +44,7 @@ __all__ = [
     "ProviderEndpoints",
     "ProviderCredentials",
     "AuthorizationURLResponse",
+    "ConnectTokenResponse",
     # UserInvitationCode
     "UserInvitationCodeCreate",
     "UserInvitationCodeRead",
